@@ -17,7 +17,7 @@ https://github.com/xiangyuecn/Recorder
 "use strict";
 
 //兼容环境
-var LM="2020-4-20 12:32:42";
+var LM="2020-5-17 08:21:54";
 var NOOP=function(){};
 //end 兼容环境 ****从以下开始copy源码*****
 
@@ -265,7 +265,14 @@ function initFn(set){
 		
 		,onProcess:NOOP //fn(buffers,powerLevel,bufferDuration,bufferSampleRate,newBufferIdx,asyncEnd) buffers=[[Int16,...],...]：缓冲的PCM数据，为从开始录音到现在的所有pcm片段；powerLevel：当前缓冲的音量级别0-100，bufferDuration：已缓冲时长，bufferSampleRate：缓冲使用的采样率（当type支持边录边转码(Worker)时，此采样率和设置的采样率相同，否则不一定相同）；newBufferIdx:本次回调新增的buffer起始索引；asyncEnd:fn() 如果onProcess是异步的(返回值为true时)，处理完成时需要调用此回调，如果不是异步的请忽略此参数，此方法回调时必须是真异步（不能真异步时需用setTimeout包裹）。onProcess返回值：如果返回true代表开启异步模式，在某些大量运算的场合异步是必须的，必须在异步处理完成时调用asyncEnd(不能真异步时需用setTimeout包裹)，在onProcess执行后新增的buffer会全部替换成空数组，因此本回调开头应立即将newBufferIdx到本次回调结尾位置的buffer全部保存到另外一个数组内，处理完成后写回buffers中本次回调的结尾位置。
 		
+		//*******高级设置******
 		//,disableEnvInFix:false 内部参数，禁用设备卡顿时音频输入丢失补偿功能
+		
+		//,takeoffEncodeChunk:NOOP //fn(chunkBytes) chunkBytes=[Uint8,...]：实时编码环境下接管编码器输出，当编码器实时编码出一块有效的二进制音频数据时实时回调此方法；参数为二进制的Uint8Array，就是编码出来的音频数据片段，所有的chunkBytes拼接在一起即为完整音频。本实现的想法最初由QQ2543775048提出
+				//当提供此回调方法时，将接管编码器的数据输出，编码器内部将放弃存储生成的音频数据；环境要求比较苛刻：如果当前环境不支持实时编码处理，将在open时直接走fail逻辑
+				//因此提供此回调后调用stop方法将无法获得有效的音频数据，因为编码器内没有音频数据，因此stop时返回的blob将是一个字节长度为0的blob
+				//目前只有mp3格式实现了实时编码，在支持实时处理的环境中将会实时的将编码出来的mp3片段通过此方法回调，所有的chunkBytes拼接到一起即为完整的mp3，此种拼接的结果比mock方法实时生成的音质更加，因为天然避免了首尾的静默
+				//目前除mp3外其他格式不可以提供此回调，提供了将在open时直接走fail逻辑
 	};
 	
 	for(var k in set){
@@ -333,6 +340,12 @@ Recorder.prototype=initFn.prototype={
 			return;
 		};
 		
+		//环境配置检查
+		var checkMsg=This.envCheck({envName:"H5",canProcess:true});
+		if(checkMsg){
+			False("不能录音："+checkMsg);
+			return;
+		};
 		
 		//请求权限，如果从未授权，一般浏览器会弹出权限请求弹框
 		var f1=function(stream){
@@ -406,14 +419,33 @@ Recorder.prototype=initFn.prototype={
 		This._stop();//清理掉已有的资源
 		
 		This.isMock=1;
+		This.mockEnvInfo=null;
 		This.buffers=[pcmData];
 		This.recSize=pcmData.length;
 		This.srcSampleRate=pcmSampleRate;
 		return This;
 	}
-	,envStart:function(mockEnv,sampleRate){//和平台环境无关的start调用
+	,envCheck:function(envInfo){//平台环境下的可用性检查，任何时候都可以调用检查，返回errMsg:""正常，"失败原因"
+		//envInfo={envName:"H5",canProcess:true}
+		var errMsg,This=this,set=This.set;
+		
+		//编码器检查环境下配置是否可用
+		if(!errMsg){
+			if(This[set.type+"_envCheck"]){//编码器已实现环境检查
+				errMsg=This[set.type+"_envCheck"](envInfo,set);
+			}else{//未实现检查的手动检查配置是否有效
+				if(set.takeoffEncodeChunk){
+					errMsg=set.type+"类型不支持设置takeoffEncodeChunk";
+				};
+			};
+		};
+		
+		return errMsg||"";
+	}
+	,envStart:function(mockEnvInfo,sampleRate){//平台环境相关的start调用
 		var This=this,set=This.set;
-		This.isMock=mockEnv?1:0;//非H5环境需要启用mock
+		This.isMock=mockEnvInfo?1:0;//非H5环境需要启用mock，并提供envCheck需要的环境信息
+		This.mockEnvInfo=mockEnvInfo;
 		This.buffers=[];//数据缓冲
 		This.recSize=0;//数据大小
 		
@@ -448,6 +480,10 @@ Recorder.prototype=initFn.prototype={
 		var buffers=This.buffers;
 		var bufferFirstIdx=buffers.length;//之前的buffer都是经过onProcess处理好的，不允许再修改
 		buffers.push(pcm);
+		
+		//有engineCtx时会被覆盖，这里保存一份
+		var buffersThis=buffers;
+		var bufferFirstIdxThis=bufferFirstIdx;
 		
 		//卡顿丢失补偿：因为设备很卡的时候导致H5接收到的数据量不够造成播放时候变速，结果比实际的时长要短，此处保证了不会变短，但不能修复丢失的音频数据造成音质变差。当前算法采用输入时间侦测下一帧是否需要添加补偿帧，需要(6次输入||超过1秒)以上才会开始侦测，如果滑动窗口内丢失超过1/3就会进行补偿
 		var now=Date.now();
@@ -515,12 +551,13 @@ Recorder.prototype=initFn.prototype={
 		
 		var duration=Math.round(bufferSize/bufferSampleRate*1000);
 		var bufferNextIdx=buffers.length;
+		var bufferNextIdxThis=buffersThis.length;
 		
 		//允许异步处理buffer数据
 		var asyncEnd=function(){
-			//重新计算size，去掉本次添加的然后重新计算
+			//重新计算size，异步的早已减去添加的，同步的需去掉本次添加的然后重新计算
 			var num=asyncBegin?0:-addSize;
-			var hasClear=0;
+			var hasClear=buffers[0]==null;
 			for(var i=bufferFirstIdx;i<bufferNextIdx;i++){
 				var buffer=buffers[i];
 				if(buffer==null){//已被主动释放内存，比如长时间实时传输录音时
@@ -535,12 +572,27 @@ Recorder.prototype=initFn.prototype={
 				};
 			};
 			
-			if(!hasClear){
-				if(engineCtx){
-					engineCtx.pcmSize+=num;
-				}else{
-					This.recSize+=num;
+			//同步清理This.buffers，不管buffers到底清了多少个，buffersThis是使用不到的进行全清
+			if(hasClear && engineCtx){
+				var i=bufferFirstIdxThis;
+				if(buffersThis[0]){
+					i=0;
 				};
+				for(;i<bufferNextIdxThis;i++){
+					buffersThis[i]=null;
+				};
+			};
+			
+			//统计修改后的size，如果异步发生clear要原样加回来，同步的无需操作
+			if(hasClear){
+				num=asyncBegin?addSize:0;
+				
+				buffers[0]=null;//彻底被清理
+			};
+			if(engineCtx){
+				engineCtx.pcmSize+=num;
+			}else{
+				This.recSize+=num;
 			};
 		};
 		//实时回调处理数据，允许修改或替换上次回调以来新增的数据 ，但是不允许修改已处理过的，不允许增删第一维数组 ，允许将第二维数组任意修改替换成空数组也可以
@@ -558,9 +610,9 @@ Recorder.prototype=initFn.prototype={
 			};
 			
 			if(hasClear){
-				console.warn("异步模式下不能清除buffers");
+				console.warn("未进入异步前不能清除buffers");
 			}else{
-				//还原size
+				//还原size，异步结束后再统计仅修改后的size，如果发生clear要原样加回来
 				if(engineCtx){
 					engineCtx.pcmSize-=addSize;
 				}else{
@@ -586,7 +638,7 @@ Recorder.prototype=initFn.prototype={
 		var This=this,set=This.set,ctx=Recorder.Ctx;
 		This._stop();
 		This.state=0;
-		This.envStart(0,ctx.sampleRate);
+		This.envStart(null,ctx.sampleRate);
 		
 		//检查open过程中stop是否已经调用过
 		if(This._SO&&This._SO+1!=This._S){//上面调用过一次 _stop
@@ -672,7 +724,9 @@ Recorder.prototype=initFn.prototype={
 		};
 		var ok=function(blob,duration){
 			console.log("["+Date.now()+"]结束 编码"+(Date.now()-t1)+"ms 音频"+duration+"ms/"+blob.size+"b");
-			if(blob.size<Math.max(100,duration/2)){//1秒小于0.5k？
+			if(set.takeoffEncodeChunk){//接管了输出，此时blob长度为0
+				console.warn("启用takeoffEncodeChunk后stop返回的blob长度为0不提供音频数据");
+			}else if(blob.size<Math.max(100,duration/2)){//1秒小于0.5k？
 				err("生成的"+set.type+"无效");
 				return;
 			};
@@ -700,10 +754,18 @@ Recorder.prototype=initFn.prototype={
 			return;
 		};
 		
+		//环境配置检查，此处仅针对mock调用，因为open已经检查过了
+		if(This.isMock){
+			var checkMsg=This.envCheck(This.mockEnvInfo||{envName:"mock",canProcess:false});//没有提供环境信息的mock时没有onProcess回调
+			if(checkMsg){
+				err("录音错误："+checkMsg);
+				return;
+			};
+		};
+		
 		//此类型有边录边转码(Worker)支持
 		var engineCtx=This.engineCtx;
 		if(This[set.type+"_complete"]&&engineCtx){
-			var pcmDatas=engineCtx.pcmDatas;
 			var duration=Math.round(engineCtx.pcmSize/set.sampleRate*1000);//采用后的数据长度和buffers的长度可能微小的不一致，是采样率连续转换的精度问题
 			
 			t1=Date.now();
